@@ -15,6 +15,7 @@ typedef struct Miner{
     unsigned int reserved_count;
     unsigned int interval;
     unsigned int totalOre;
+    pthread_t  minerThread;
     pthread_cond_t minerProduced;
     pthread_mutex_t condMutex_miner;
     pthread_mutex_t minerActiveMutex;
@@ -31,6 +32,7 @@ typedef struct Smelter{
     unsigned int total_produce;
     unsigned int available;
     sem_t smelterMutex;
+    pthread_t  smelterThread;
     pthread_cond_t twoOres;
     pthread_cond_t storageAvail;
     pthread_mutex_t condMutex_smelter;
@@ -47,8 +49,10 @@ typedef struct Foundry{
     unsigned int waiting_iron;
     unsigned int waiting_coal;
     unsigned int total_produce;
-    unsigned int available;
+    unsigned int available_iron;
+    unsigned int available_coal;
     sem_t foundryMutex;
+    pthread_t  foundryThread;
     pthread_cond_t oneIronOneCoal;
     pthread_cond_t storageAvail;
     pthread_mutex_t condMutex_foundryStroage;
@@ -61,6 +65,10 @@ typedef struct Foundry{
 typedef struct Transporter{
     unsigned int ID;
     unsigned int interval;
+    unsigned int numMiners;
+    unsigned int numSmelters;
+    unsigned int numFoundries;
+    pthread_t transporterThread;
     Miner* miners;
     Smelter* smelters;
     Foundry* foundries;
@@ -71,6 +79,17 @@ typedef struct Transporter{
 pthread_cond_t producerFinished = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t producerMutex = PTHREAD_MUTEX_INITIALIZER;
 
+
+int numAvailableMiners = 0;
+int nonActiveMiners = 0;
+pthread_mutex_t minerAvailableMutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t availableMinerCond = PTHREAD_COND_INITIALIZER;
+
+
+int numNonActiveProducers = 0;
+int numReadyProducers[3] = {0,0,0};
+pthread_mutex_t producerReadyMutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cond_producerReadyMutex = PTHREAD_COND_INITIALIZER;
 void init_miner(Miner* miner,unsigned int ID,
                 OreType oreType,unsigned int capacity, unsigned int interval, unsigned int totalOre){
     pthread_mutex_init(&miner->minerActiveMutex,NULL);
@@ -150,7 +169,7 @@ void init_foundry(Foundry* foundry, unsigned int ID,
     foundry->total_produce = 0;
     foundry->tv_foundry = (struct timeval){0};
     foundry->ts_foundry = (struct timespec){0};
-    foundry->available = loading_capacity;
+    foundry->available_iron = foundry->available_coal = loading_capacity;
     pthread_cond_init(&foundry->oneIronOneCoal,NULL);
     pthread_cond_init(&foundry->storageAvail,NULL);
     pthread_mutex_init(&foundry->condMutex_foundry,NULL);
@@ -260,18 +279,25 @@ void transporter_foundry(unsigned int ID,unsigned int interval,Foundry* foundry,
 
 }
 
-Smelter* find1MissingSmelter(Smelter* smelters,int lenSmelters){
+Smelter* find1MissingSmelter(Smelter* smelters,int lenSmelters,OreType oreType){
     if(!lenSmelters)
         return NULL;
+    if(oreType == COAL)
+        return  NULL;
     for(int i =0; i < lenSmelters;i++){
+        if(smelters[i].oreType != oreType)
+            continue;
         pthread_mutex_lock(&smelters[i].condMutex_smelterStorage);
         sem_wait(&smelters[i].smelterMutex);
-        if(smelters[i].active && (smelters[i].waiting_ore_count && smelters->available)){
+        if(smelters[i].active && (smelters[i].waiting_ore_count && smelters[i].available)){
             sem_post(&smelters[i].smelterMutex);
+            smelters[i].available--;
             pthread_mutex_unlock(&smelters[i].condMutex_smelterStorage);
+
             return &smelters[i];
         }
         sem_post(&smelters[i].smelterMutex);
+
         pthread_mutex_unlock(&smelters[i].condMutex_smelterStorage);
     }
     return NULL;
@@ -279,27 +305,47 @@ Smelter* find1MissingSmelter(Smelter* smelters,int lenSmelters){
 Foundry* find1MissingFoundries(Foundry* foundries,int lenFoundries,OreType oreType){
     if(!lenFoundries)
         return NULL;
+    if(oreType == COPPER)
+        return NULL;
     for(int i =0; i < lenFoundries;i++){
         pthread_mutex_lock(&foundries[i].condMutex_foundryStroage);
         sem_wait(&foundries[i].foundryMutex);
-        if(foundries[i].active && (((foundries[i].waiting_coal  && oreType==IRON) ||
-                (foundries[i].waiting_iron && oreType == COAL)) && foundries[i].available)){
+
+        if(foundries[i].active){
+            if((foundries[i].waiting_coal && oreType == IRON) && foundries[i].available_iron){
+                foundries[i].available_iron--;
+                sem_post(&foundries[i].foundryMutex);
+                pthread_mutex_unlock(&foundries[i].condMutex_foundryStroage);
+                return &foundries[i];
+            }else if((foundries[i].waiting_iron && oreType == COAL) && foundries[i].available_coal){
+                foundries[i].available_coal--;
+                sem_post(&foundries[i].foundryMutex);
+                pthread_mutex_unlock(&foundries[i].condMutex_foundryStroage);
+                return &foundries[i];
+            }else{
+                sem_post(&foundries[i].foundryMutex);
+                pthread_mutex_unlock(&foundries[i].condMutex_foundryStroage);
+            }
+        }else{
             sem_post(&foundries[i].foundryMutex);
             pthread_mutex_unlock(&foundries[i].condMutex_foundryStroage);
-            return &foundries[i];
         }
-        sem_post(&foundries[i].foundryMutex);
-        pthread_mutex_unlock(&foundries[i].condMutex_foundryStroage);
+
     }
     return NULL;
 
 }
-Smelter* findAvailableSmelters(Smelter* smelters,int lenSmelters){
+Smelter* findAvailableSmelters(Smelter* smelters,int lenSmelters,OreType oreType){
     if(!lenSmelters)
         return NULL;
+    if(oreType == COAL)
+        return NULL;
     for(int i =0; i < lenSmelters;i++){
+        if(smelters[i].oreType != oreType)
+            continue;
         pthread_mutex_lock(&smelters[i].condMutex_smelterStorage);
-        if(smelters->active && smelters->available){
+        if(smelters[i].active && smelters[i].available){
+            smelters[i].available--;
             pthread_mutex_unlock(&smelters[i].condMutex_smelterStorage);
             return &smelters[i];
         }
@@ -308,64 +354,85 @@ Smelter* findAvailableSmelters(Smelter* smelters,int lenSmelters){
     return NULL;
 
 }
-Foundry* findAvailableFoundries(Foundry* foundries,int lenFoundries){
+Foundry* findAvailableFoundries(Foundry* foundries,int lenFoundries,OreType oreType){
     if(!lenFoundries)
+        return NULL;
+    if(oreType == COPPER)
         return NULL;
     for(int i =0; i < lenFoundries;i++){
         pthread_mutex_lock(&foundries[i].condMutex_foundryStroage);
-        if(foundries->active && foundries->available){
+        if(foundries[i].active){
+            if((oreType ==IRON && foundries[i].available_iron) &&
+                (foundries[i].available_coal != foundries[i].loading_capacity
+                || foundries[i].available_iron == foundries[i].loading_capacity)){
+                foundries[i].available_iron--;
+                pthread_mutex_unlock(&foundries[i].condMutex_foundryStroage);
+                return &foundries[i];
+            }else if((oreType ==COAL && foundries[i].available_coal)  &&
+                    (foundries[i].available_iron != foundries[i].loading_capacity
+                     || foundries[i].available_coal == foundries[i].loading_capacity)){
+                foundries[i].available_coal--;
+                pthread_mutex_unlock(&foundries[i].condMutex_foundryStroage);
+                return &foundries[i];
+            }else{
+                pthread_mutex_unlock(&foundries[i].condMutex_foundryStroage);
+            }
+        }else{
             pthread_mutex_unlock(&foundries[i].condMutex_foundryStroage);
-            return &foundries[i];
         }
-        pthread_mutex_unlock(&foundries[i].condMutex_foundryStroage);
+
     }
     return NULL;
 
 }
 void waitProducer(Smelter* smelters,Foundry* foundries,
-        int order,Smelter** resSmelter,
-        Foundry** resFoundry,
-        int lenFoundries,int lenSmelters,OreType oreType){
+                  int order,Smelter** resSmelter,
+                  Foundry** resFoundry,
+                  int lenFoundries,int lenSmelters,OreType oreType,int transporterID){
     Smelter* smelter;
     Foundry* foundry;
     if(order){
 
-        if((smelter = find1MissingSmelter(smelters,lenSmelters))){
+        if((smelter = find1MissingSmelter(smelters,lenSmelters,oreType))){
             *resSmelter = smelter;
             return;
 
         }
         if((foundry = find1MissingFoundries(foundries,lenFoundries,oreType))){
             *resFoundry = foundry;
-            return;;
+
+            return;
         }
-        if((smelter = findAvailableSmelters(smelters,lenSmelters))){
+        if((smelter = findAvailableSmelters(smelters,lenSmelters,oreType))){
             *resSmelter = smelter;
             return;
         }
-        if((foundry = findAvailableFoundries(foundries,lenFoundries))){
+        if((foundry = findAvailableFoundries(foundries,lenFoundries,oreType))){
             *resFoundry = foundry;
-            return;;
+            return;
         }
 
     }else{
+
         if((foundry = find1MissingFoundries(foundries,lenFoundries,oreType))){
             *resFoundry = foundry;
-            return;;
+            return;
         }
-        if((smelter = find1MissingSmelter(smelters,lenSmelters))){
+        if((smelter = find1MissingSmelter(smelters,lenSmelters,oreType))){
             *resSmelter = smelter;
             return;
 
         }
-        if((foundry = findAvailableFoundries(foundries,lenFoundries))){
+        if((foundry = findAvailableFoundries(foundries,lenFoundries,oreType))){
             *resFoundry = foundry;
             return;
         }
-        if((smelter = findAvailableSmelters(smelters,lenSmelters))){
+        if((smelter = findAvailableSmelters(smelters,lenSmelters,oreType))){
             *resSmelter = smelter;
             return;
         }
+
+
 
     }
 
@@ -402,93 +469,64 @@ void* transporter_subroutine(void* transporterArg){
     FillTransporterInfo(&tInfo,transporter->ID,NULL);
     WriteOutput(NULL,&tInfo,NULL,NULL,TRANSPORTER_CREATED);
     int lastID = 0;
-    while(1){
-        OreType carriedOre = -1;
-        Miner * miner = waitNextLoad(transporter,2,lastID);
-        pthread_mutex_lock(&miner->minerActiveMutex);
-        if(miner->reserved_count){
-            miner->reserved_count --;
-            pthread_mutex_unlock(&miner->minerActiveMutex);
-        }else if(miner->active){
-            pthread_cond_wait(&miner->minerProduced,&miner->minerActiveMutex);
+    OreType carriedOre = -1;
+    Miner* miner;
+    while(1) {
+        pthread_mutex_lock(&minerAvailableMutex);
+        if (!numAvailableMiners && nonActiveMiners == transporter->numMiners) {
+            pthread_cond_signal(&availableMinerCond);
+            pthread_mutex_unlock(&minerAvailableMutex);
+            FillTransporterInfo(&tInfo,transporter->ID,&carriedOre);
+            WriteOutput(NULL,&tInfo,NULL,NULL,TRANSPORTER_STOPPED);
+            return NULL;
+
+        } else if (numAvailableMiners) {
+            numAvailableMiners--;
+            pthread_mutex_unlock(&minerAvailableMutex);
+            miner = waitNextLoad(transporter, transporter->numMiners, lastID);
+
+            pthread_mutex_lock(&miner->minerActiveMutex);
             miner->reserved_count--;
             pthread_mutex_unlock(&miner->minerActiveMutex);
-        }else{
 
-            pthread_mutex_unlock(&miner->minerActiveMutex);
-            break;
+        } else {
+            pthread_cond_wait(&availableMinerCond, &minerAvailableMutex);
+            pthread_mutex_unlock(&minerAvailableMutex);
+            continue;
         }
-
         transporter_miner(transporter->ID,transporter->interval,miner,&carriedOre);
-        /*
-        Smelter * smelter = transporter->smelters;
-        pthread_mutex_lock(&smelter->condMutex_smelterStorage);
 
-        while(smelter->available ==0)
-            pthread_cond_wait(&smelter->storageAvail,&smelter->condMutex_smelterStorage);
-        smelter->available -= 1;
-        pthread_mutex_unlock(&smelter->condMutex_smelterStorage);
-        transporter_smelter(transporter->ID,transporter->interval,smelter,&carriedOre);
+        pthread_mutex_lock(&producerReadyMutex);
+        // Round
+        round:
+        if(!numReadyProducers[carriedOre] && numNonActiveProducers == (transporter->numFoundries+ transporter->numSmelters)) {
+            pthread_cond_signal(&cond_producerReadyMutex);
+            pthread_mutex_unlock(&producerReadyMutex);
+            continue;
+        }else if(numReadyProducers[carriedOre]){
+            numReadyProducers[carriedOre]--;
+            pthread_mutex_unlock(&producerReadyMutex);
+            Foundry* foundry = NULL;
+            Smelter* smelter = NULL;
+            waitProducer(transporter->smelters,transporter->foundries,lastID%2,
+                         &smelter,&foundry,transporter->numSmelters,transporter->numSmelters,carriedOre,transporter->ID);
 
-        //usleep(args.interval - (args.interval*0.01) + (rand()%(int)(args.interval*0.02)));
-        */
-
-        /*
-        Foundry *foundry = transporter->foundries;
-        pthread_mutex_lock(&foundry->condMutex_foundryStroage);
-        while(foundry->available == 0)
-            pthread_cond_wait(&foundry->storageAvail,&foundry->condMutex_foundryStroage);
-        foundry->available -=1;
-        pthread_mutex_unlock(&foundry->condMutex_foundryStroage);
-        transporter_foundry(transporter->ID,transporter->interval,foundry,&carriedOre);
-        lastID= (lastID+1) % 2;
-         */
-        Foundry* foundry = NULL;
-        Smelter* smelter = NULL;
-        waitProducer(transporter->smelters,transporter->foundries,lastID%2,&smelter,&foundry,1,1,carriedOre);
-        if(foundry){
-            pthread_mutex_lock(&foundry->condMutex_foundryStroage);
-            foundry->available --;
-            pthread_mutex_unlock(&foundry->condMutex_foundryStroage);
-            transporter_foundry(transporter->ID,transporter->interval,foundry,&carriedOre);
-
-        }else if(smelter){
-            pthread_mutex_lock(&smelter->condMutex_smelterStorage);
-            smelter->available--;
-            pthread_mutex_unlock(&smelter->condMutex_smelterStorage);
-            transporter_smelter(transporter->ID,transporter->interval,smelter,&carriedOre);
-
-        }else{
-
-            pthread_mutex_lock(&producerMutex);
-            pthread_cond_wait(&producerFinished,&producerMutex);
-            pthread_mutex_unlock(&producerMutex);
-
-            waitProducer(transporter->smelters,transporter->foundries,lastID%2,&smelter,&foundry,1,0,carriedOre);
             if(foundry){
-                pthread_mutex_lock(&foundry->condMutex_foundryStroage);
-                foundry->available --;
-                pthread_mutex_unlock(&foundry->condMutex_foundryStroage);
                 transporter_foundry(transporter->ID,transporter->interval,foundry,&carriedOre);
 
             }else if(smelter){
-                pthread_mutex_lock(&smelter->condMutex_smelterStorage);
-                smelter->available--;
-                pthread_mutex_unlock(&smelter->condMutex_smelterStorage);
                 transporter_smelter(transporter->ID,transporter->interval,smelter,&carriedOre);
 
-            }else{
-                pthread_mutex_lock(&producerMutex);
-                pthread_cond_signal(&producerFinished);
-                pthread_mutex_unlock(&producerMutex);
-                continue;
             }
-
-
+        }else{
+            pthread_cond_wait(&cond_producerReadyMutex,&producerReadyMutex);
+            goto round;
         }
-        lastID= (lastID+1) % 2;
+        lastID= (lastID+1) % (transporter->numMiners);
 
     }
+
+
 
 }
 
@@ -520,6 +558,12 @@ void* miner_subroutine(void* minerArg){
         pthread_cond_signal(&miner->minerProduced);
         pthread_mutex_unlock(&miner->minerActiveMutex);
 
+        pthread_mutex_lock(&minerAvailableMutex);
+        numAvailableMiners++;
+        pthread_cond_signal(&availableMinerCond);
+        pthread_mutex_unlock(&minerAvailableMutex);
+
+
         WriteOutput(&mInfo,NULL,NULL,NULL,MINER_FINISHED);
         usleep(miner->interval - (miner->interval*0.01) + (rand()%(int)(miner->interval*0.02)));
 
@@ -530,6 +574,11 @@ void* miner_subroutine(void* minerArg){
     pthread_mutex_lock(&miner->minerActiveMutex);
     miner->active =0;
     pthread_mutex_unlock(&miner->minerActiveMutex);
+
+    pthread_mutex_lock(&minerAvailableMutex);
+    nonActiveMiners++;
+    pthread_cond_signal(&availableMinerCond);
+    pthread_mutex_unlock(&minerAvailableMutex);
 
     sem_wait(&miner->minerMutex);
     FillMinerInfo(&mInfo,miner->ID,miner->oreType,miner->capacity,miner->current_count);
@@ -569,7 +618,7 @@ void* smelter_subroutine(void* smelterArg){
             }
         }
 
-
+        smelter->waiting_ore_count -= 2;
         FillSmelterInfo(&sInfo,smelter->ID,smelter->oreType,
                         smelter->loading_capacity,smelter->waiting_ore_count,smelter->total_produce);
         sem_post(&smelter->smelterMutex);
@@ -580,7 +629,6 @@ void* smelter_subroutine(void* smelterArg){
         // Smelter produced
         sem_wait(&smelter->smelterMutex);
         smelter->total_produce += 1;
-        smelter->waiting_ore_count -= 2;
         FillSmelterInfo(&sInfo,smelter->ID,smelter->oreType,
                         smelter->loading_capacity,smelter->waiting_ore_count,smelter->total_produce);
         sem_post(&smelter->smelterMutex);
@@ -590,10 +638,24 @@ void* smelter_subroutine(void* smelterArg){
         pthread_cond_signal(&smelter->storageAvail);
         pthread_mutex_unlock(&smelter->condMutex_smelterStorage);
 
+        pthread_mutex_lock(&producerReadyMutex);
+        numReadyProducers[smelter->oreType]+=2;
+        pthread_cond_signal(&cond_producerReadyMutex);
+        pthread_mutex_unlock(&producerReadyMutex);
+
 
         WriteOutput(NULL,NULL,&sInfo,NULL,SMELTER_FINISHED);
     }
     //Smelter stopped
+    pthread_mutex_lock(&smelter->condMutex_smelterStorage);
+    smelter->active =0;
+    pthread_mutex_unlock(&smelter->condMutex_smelterStorage);
+
+    pthread_mutex_lock(&producerReadyMutex);
+    numNonActiveProducers++;
+    pthread_cond_signal(&cond_producerReadyMutex);
+    pthread_mutex_unlock(&producerReadyMutex);
+
     sem_wait(&smelter->smelterMutex);
     FillSmelterInfo(&sInfo,smelter->ID,smelter->oreType,
                     smelter->loading_capacity,smelter->waiting_ore_count,smelter->total_produce);
@@ -614,7 +676,6 @@ void* foundry_subroutine(void* foundryArg){
     WriteOutput(NULL,NULL,NULL,&fInfo,FOUNDRY_CREATED);
     while(1){
 
-
         sem_wait(&foundry->foundryMutex);
         if(!foundry->waiting_iron || !foundry->waiting_coal){
             sem_post(&foundry->foundryMutex);
@@ -631,17 +692,6 @@ void* foundry_subroutine(void* foundryArg){
                 break;
             }
         }
-
-        FillFoundryInfo(&fInfo,foundry->ID,foundry->loading_capacity,
-                        foundry->waiting_iron,foundry->waiting_coal,
-                        foundry->total_produce);
-        sem_post(&foundry->foundryMutex);
-        WriteOutput(NULL,NULL,NULL,&fInfo,FOUNDRY_STARTED);
-        usleep(foundry->interval - (foundry->interval*0.01) + (rand()%(int)(foundry->interval*0.02)));
-
-        //Foundry produced
-        sem_wait(&foundry->foundryMutex);
-        foundry->total_produce+=1;
         foundry->waiting_coal-=1;
         foundry->waiting_iron-=1;
         FillFoundryInfo(&fInfo,foundry->ID,foundry->loading_capacity,
@@ -649,14 +699,32 @@ void* foundry_subroutine(void* foundryArg){
                         foundry->total_produce);
         sem_post(&foundry->foundryMutex);
 
-        //TODO: Storage code here...
+
+        WriteOutput(NULL,NULL,NULL,&fInfo,FOUNDRY_STARTED);
+        usleep(foundry->interval - (foundry->interval*0.01) + (rand()%(int)(foundry->interval*0.02)));
+
+        //Foundry produced
+        sem_wait(&foundry->foundryMutex);
+        foundry->total_produce+=1;
+        FillFoundryInfo(&fInfo,foundry->ID,foundry->loading_capacity,
+                        foundry->waiting_iron,foundry->waiting_coal,
+                        foundry->total_produce);
+        sem_post(&foundry->foundryMutex);
+
         pthread_mutex_lock(&foundry->condMutex_foundryStroage);
-        foundry->available +=2;
+        foundry->available_iron ++;
+        foundry->available_coal ++;
         pthread_mutex_unlock(&foundry->condMutex_foundryStroage);
 
         pthread_mutex_lock(&producerMutex);
         pthread_cond_signal(&producerFinished);
         pthread_mutex_unlock(&producerMutex);
+
+        pthread_mutex_lock(&producerReadyMutex);
+        numReadyProducers[COAL]++;
+        numReadyProducers[IRON]++;
+        pthread_cond_signal(&cond_producerReadyMutex);
+        pthread_mutex_unlock(&producerReadyMutex);
 
         WriteOutput(NULL,NULL,NULL,&fInfo,FOUNDRY_FINISHED);
     }
@@ -664,6 +732,13 @@ void* foundry_subroutine(void* foundryArg){
     pthread_mutex_lock(&foundry->condMutex_foundryStroage);
     foundry->active =0;
     pthread_mutex_unlock(&foundry->condMutex_foundryStroage);
+
+
+    pthread_mutex_lock(&producerReadyMutex);
+    numNonActiveProducers++;
+    pthread_cond_signal(&cond_producerReadyMutex);
+
+    pthread_mutex_unlock(&producerReadyMutex);
 
     pthread_mutex_lock(&producerMutex);
     pthread_cond_signal(&producerFinished);
@@ -680,47 +755,125 @@ void* foundry_subroutine(void* foundryArg){
 
 }
 
+
+void readInput(Transporter** transporters,Miner** miners,Smelter** smelters,Foundry** foundries,
+               unsigned int* numMiners,
+               unsigned int* numTransporters,
+               unsigned int* numSmelters,unsigned int* numFoundries){
+    unsigned int minerInterval,minerCapacity,
+            minerTotalOre,transporterInterval,
+            smelterInterval,foundryInterval,smelterCapacity,foundryCapacity;
+    OreType minerOreType,smelterOreType;
+    fscanf(stdin,"%d",numMiners);
+    *miners = malloc(sizeof(Miner)*(*numMiners));
+    for(int i=0; i< *numMiners;i++){
+        fscanf(stdin,"%d %d %d %d",&minerInterval,&minerCapacity,&minerOreType,&minerTotalOre);
+        init_miner(&(*miners)[i],(i+1),minerOreType,minerCapacity,minerInterval,minerTotalOre);
+    }
+    fscanf(stdin,"%d",numTransporters);
+    *transporters = malloc(sizeof(Transporter)*(*numTransporters));
+    for(int i=0; i< *numTransporters;i++){
+        fscanf(stdin,"%d",&transporterInterval);
+        init_transporter(&(*transporters)[i],i+1,transporterInterval,*miners,NULL,NULL);
+    }
+    fscanf(stdin,"%d",numSmelters);
+    *smelters = malloc(sizeof(Smelter)*(*numSmelters));
+    for(int i=0; i< *numSmelters;i++){
+        fscanf(stdin,"%d %d %d",&smelterInterval,&smelterCapacity,&smelterOreType);
+        init_smelter(&(*smelters)[i],i+1,smelterOreType,smelterCapacity,smelterInterval);
+        numReadyProducers[smelterOreType] += smelterCapacity;
+    }
+    fscanf(stdin,"%d",numFoundries);
+    *foundries = malloc(sizeof(Foundry)*(*numFoundries));
+    for(int i=0; i< *numFoundries;i++){
+        fscanf(stdin,"%d %d",&foundryInterval,&foundryCapacity);
+        init_foundry(&(*foundries)[i],i+1,foundryCapacity,foundryInterval);
+        numReadyProducers[IRON] += foundryCapacity;
+        numReadyProducers[COAL] += foundryCapacity;
+    }
+    for(int i=0; i< *numTransporters;i++){
+        (*transporters)[i].foundries = *foundries;
+        (*transporters)[i].smelters =  *smelters;
+        (*transporters)[i].numMiners = *numMiners;
+        (*transporters)[i].numSmelters = *numSmelters;
+        (*transporters)[i].numFoundries = *numFoundries;
+    }
+
+
+
+}
 int main() {
     time_t t;
     srand((unsigned) time(&t));
     InitWriteOutput();
-    pthread_t minerID1,minerID2,transporterID,transporter2,smelterID,foundryID;
-    Miner * miner = malloc(sizeof(Miner)*2);
-    Transporter *transporter = malloc(sizeof(Transporter)*2);
-    Smelter* smelter = malloc(sizeof(Smelter));
-    Foundry* foundry = malloc(sizeof(Foundry));
-    init_miner(&miner[0],1,IRON,10,50,50);
-    init_miner(&miner[1],2,COAL,10,50,40);
-    init_smelter(smelter,1,IRON,4,70);
-    init_foundry(foundry,1,6,50);
-    init_transporter(&transporter[0],1,50,miner,smelter,foundry);
-    init_transporter(&transporter[1],2,50,miner,smelter,foundry);
+    Transporter* transporters;
+    Smelter* smelters;
+    Miner* miners;
+    Foundry* foundries;
+    unsigned  int numTransporters,numSmelters,numMiners,numFoundries;
+    readInput(&transporters,&miners,&smelters,&foundries,&numMiners,&numTransporters,&numSmelters,&numFoundries);
+    for(int i= 0; i< numMiners;i++){
+        pthread_create(&miners[i].minerThread, NULL, miner_subroutine,(void*)&miners[i]);
 
+    }
+    for(int i= 0; i< numFoundries;i++){
+        pthread_create(&foundries[i].foundryThread, NULL, foundry_subroutine,(void*)&foundries[i]);
 
-    pthread_create(&minerID1, NULL, miner_subroutine,(void*)&miner[0]);
-    pthread_create(&minerID2, NULL, miner_subroutine,(void*)&miner[1]);
-    pthread_create(&smelterID, NULL, smelter_subroutine, (void*)smelter);
-    pthread_create(&transporterID, NULL, transporter_subroutine, (void*)&transporter[0]);
-    pthread_create(&transporter2, NULL, transporter_subroutine, (void*)&transporter[1]);
-    pthread_create(&foundryID, NULL, foundry_subroutine, (void*)foundry);
+    }
+    for(int i= 0; i< numSmelters;i++){
+        pthread_create(&smelters[i].smelterThread, NULL, smelter_subroutine,(void*)&smelters[i]);
 
-    pthread_join(minerID1,NULL);
-    pthread_join(minerID2,NULL);
-    pthread_join(transporterID,NULL);
-    pthread_join(transporter2,NULL);
-    pthread_join(foundryID,NULL);
-    pthread_join(smelterID,NULL);
-    destroy_miner(&miner[0]);
-    destroy_miner(&miner[1]);
-    destroy_transporter(&transporter[0]);
-    destroy_transporter(&transporter[1]);
-    destroy_foundry(foundry);
-    destroy_smelter(smelter);
-    free(miner);
-    free(transporter);
-    free(foundry);
-    free(smelter);
-    //pthread_join(foundryID,NULL);
+    }
+    for(int i= 0; i< numTransporters;i++){
+        pthread_create(&transporters[i].transporterThread, NULL, transporter_subroutine,(void*)&transporters[i]);
+
+    }
+
+    // JOIN
+
+    for(int i= 0; i< numMiners;i++){
+        pthread_join(miners[i].minerThread,NULL);
+        //destroy_miner(&miners[i]);
+    }
+    for(int i= 0; i< numFoundries;i++){
+        pthread_join(foundries[i].foundryThread,NULL);
+        //destroy_foundry(&foundries[i]);
+
+    }
+    for(int i= 0; i< numSmelters;i++){
+        pthread_join(smelters[i].smelterThread,NULL);
+        //destroy_smelter(&smelters[i]);
+
+    }
+    for(int i= 0; i< numTransporters;i++){
+        pthread_join(transporters[i].transporterThread,NULL);
+        //destroy_transporter(&transporters[i]);
+    }
+
+    // DESTROY
+
+    for(int i= 0; i< numMiners;i++){
+
+        destroy_miner(&miners[i]);
+    }
+    for(int i= 0; i< numFoundries;i++){
+
+        destroy_foundry(&foundries[i]);
+
+    }
+    for(int i= 0; i< numSmelters;i++){
+
+        destroy_smelter(&smelters[i]);
+
+    }
+    for(int i= 0; i< numTransporters;i++){
+
+        destroy_transporter(&transporters[i]);
+    }
+    free(miners);
+    free(transporters);
+    free(foundries);
+    free(smelters);
 
 
     return 0;
